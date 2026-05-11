@@ -108,6 +108,35 @@ def decode_video_latent(vae, latent):
     return images
 
 
+class GenerationProgress:
+    def __init__(self, unique_id=None, total=8):
+        self.unique_id = str(unique_id) if unique_id is not None else None
+        self.total = int(total)
+        self.current = 0
+        try:
+            import comfy.utils
+
+            self.progress_bar = comfy.utils.ProgressBar(self.total, node_id=self.unique_id)
+        except Exception:
+            self.progress_bar = None
+
+    def phase(self, text):
+        self.current = min(self.current + 1, self.total)
+        if self.progress_bar is not None:
+            try:
+                self.progress_bar.update_absolute(self.current, self.total)
+            except Exception:
+                pass
+        if self.unique_id is None:
+            return
+        try:
+            import server
+
+            server.PromptServer.instance.send_progress_text(f"WAN 2.2 Generate: {text}", self.unique_id)
+        except Exception:
+            pass
+
+
 def model_latent_channels(model):
     try:
         latent_format = model.get_model_object("latent_format")
@@ -145,6 +174,7 @@ def sample_wan22_video(
     scheduler,
     denoise,
     switch_step,
+    progress=None,
 ):
     import nodes as comfy_nodes
 
@@ -155,6 +185,8 @@ def sample_wan22_video(
     denoise = float(denoise)
 
     if switch_step > 0:
+        if progress is not None:
+            progress.phase(f"Sampling high-noise phase ({switch_step} steps)")
         latent = comfy_nodes.common_ksampler(
             model=high_model,
             seed=seed,
@@ -172,6 +204,8 @@ def sample_wan22_video(
         )[0]
 
     if switch_step < steps:
+        if progress is not None:
+            progress.phase(f"Sampling low-noise phase ({steps - switch_step} steps)")
         latent = comfy_nodes.common_ksampler(
             model=low_model,
             seed=seed,
@@ -259,6 +293,9 @@ def generation_input_types():
             "start_images": ("IMAGE", {"tooltip": "Optional IMAGE batch inserted from frame 0."}),
             "ref_image": ("IMAGE", {"tooltip": "Optional WAN 2.2 reference image encoded as reference_latents."}),
             "control_video": ("IMAGE", {"tooltip": "Optional WAN 2.2 control video encoded into the first concat slot."}),
+        },
+        "hidden": {
+            "unique_id": "UNIQUE_ID",
         },
     }
 
@@ -463,11 +500,13 @@ class WAN22GenerateAllInOne:
         ]
         return (guides_part, tuple((name, kwargs.get(name)) for name in tracked))
 
-    def run(self, high_model, low_model, clip, vae, positive_prompt, negative_prompt, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, seed, steps, cfg, sampler_name, scheduler, switch_step, denoise, guides_json, start_images=None, ref_image=None, control_video=None):
+    def run(self, high_model, low_model, clip, vae, positive_prompt, negative_prompt, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, seed, steps, cfg, sampler_name, scheduler, switch_step, denoise, guides_json, start_images=None, ref_image=None, control_video=None, unique_id=None):
+        progress = GenerationProgress(unique_id)
         if sampler_name not in sampler_names():
             raise ValueError(f"Unknown sampler_name: {sampler_name}")
         if scheduler not in scheduler_names():
             raise ValueError(f"Unknown scheduler: {scheduler}")
+        progress.phase("Inspecting WAN model channels")
         high_channels = model_latent_channels(high_model)
         low_channels = model_latent_channels(low_model)
         uses_high = int(switch_step) > 0
@@ -480,8 +519,10 @@ class WAN22GenerateAllInOne:
         concat_slots = min(high_slots, low_slots) if uses_high and uses_low else (high_slots if uses_high else low_slots)
         if concat_slots <= 0:
             raise ValueError("The selected high_model does not appear to expose WAN image-conditioning channels.")
+        progress.phase("Encoding prompts")
         positive = encode_prompt(clip, positive_prompt)
         negative = encode_prompt(clip, negative_prompt)
+        progress.phase("Preparing guides")
         positive_guided, negative_guided, latent = run_apply_guides(
             positive,
             negative,
@@ -519,8 +560,12 @@ class WAN22GenerateAllInOne:
             scheduler,
             denoise,
             switch_step,
+            progress=progress,
         )
-        return (decode_video_latent(vae, sampled),)
+        progress.phase("Decoding video")
+        images = decode_video_latent(vae, sampled)
+        progress.phase("Done")
+        return (images,)
 
 
 NODE_CLASS_MAPPINGS = {
