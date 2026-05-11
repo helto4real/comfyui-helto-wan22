@@ -15,6 +15,7 @@ GUIDE_DEFAULTS = {
     "pad_color": "0,0,0",
     "global_strength": 1.0,
     "start_images_strength": 0.85,
+    "structural_repulsion_boost": 1.0,
 }
 GENERATION_DEFAULTS = {
     "seed": 0,
@@ -251,6 +252,7 @@ def guide_settings_input_types(include_start_strength=True):
     }
     if include_start_strength:
         settings["start_images_strength"] = ("FLOAT", {"default": GUIDE_DEFAULTS["start_images_strength"], "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Strength for the optional start image sequence before global_strength is applied."})
+    settings["structural_repulsion_boost"] = ("FLOAT", {"default": GUIDE_DEFAULTS["structural_repulsion_boost"], "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "High-noise structural repulsion boost between guide anchors. 1.0 disables the extra transition guidance."})
     return settings
 
 
@@ -334,6 +336,7 @@ def run_apply_guides(
     start_images_strength=0.85,
     ref_image=None,
     control_video=None,
+    structural_repulsion_boost=1.0,
     sampler_latent_channels=None,
     concat_slots=2,
     concat_slot_channels=None,
@@ -359,6 +362,7 @@ def run_apply_guides(
         start_images_strength=start_images_strength,
         ref_image=ref_image,
         control_video=control_video,
+        structural_repulsion_boost=structural_repulsion_boost,
         sampler_latent_channels=sampler_latent_channels,
         concat_slots=concat_slots,
         concat_slot_channels=concat_slot_channels,
@@ -383,9 +387,8 @@ class WAN22MultiImageI2VGuide:
         except Exception:
             return guides_json
 
-    def run(self, positive, negative, vae, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, guides_json, start_images=None, ref_image=None, control_video=None):
-        positive_guided, negative_guided, latent = run_apply_guides(positive, negative, vae, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, guides_json, start_images, start_images_strength, ref_image, control_video)
-        return positive_guided, positive_guided, negative_guided, latent
+    def run(self, positive, negative, vae, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, structural_repulsion_boost, guides_json, start_images=None, ref_image=None, control_video=None):
+        return run_apply_guides(positive, negative, vae, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, guides_json, start_images, start_images_strength, ref_image, control_video, structural_repulsion_boost)
 
 
 class WAN22ImageGuideManager:
@@ -414,7 +417,7 @@ class WAN22ImageGuideManager:
         except Exception:
             return guides_json
 
-    def run(self, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, width, height, length, guides_json):
+    def run(self, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, structural_repulsion_boost, width, height, length, guides_json):
         return (
             build_guides_payload(
                 guides_json,
@@ -425,6 +428,7 @@ class WAN22ImageGuideManager:
                 pad_color=pad_color,
                 global_strength=float(global_strength),
                 start_images_strength=float(start_images_strength),
+                structural_repulsion_boost=float(structural_repulsion_boost),
                 width=int(width),
                 height=int(height),
                 length=int(length),
@@ -451,7 +455,7 @@ class WAN22ApplyImageGuides:
             return image_guides
 
     def run(self, positive, negative, vae, width, height, length, batch_size, image_guides, start_images=None, ref_image=None, control_video=None, **_legacy_inputs):
-        positive_guided, negative_guided, latent = run_apply_guides(
+        positive_high, positive_low, negative_guided, latent = run_apply_guides(
             positive,
             negative,
             vae,
@@ -470,8 +474,9 @@ class WAN22ApplyImageGuides:
             guides_setting(image_guides, "start_images_strength"),
             ref_image,
             control_video,
+            guides_setting(image_guides, "structural_repulsion_boost"),
         )
-        return positive_guided, positive_guided, negative_guided, latent
+        return positive_high, positive_low, negative_guided, latent
 
 
 class WAN22GenerateAllInOne:
@@ -505,6 +510,7 @@ class WAN22GenerateAllInOne:
             "pad_color",
             "global_strength",
             "start_images_strength",
+            "structural_repulsion_boost",
             "seed",
             "steps",
             "cfg",
@@ -516,7 +522,7 @@ class WAN22GenerateAllInOne:
         ]
         return (guides_part, tuple((name, kwargs.get(name)) for name in tracked))
 
-    def run(self, high_model, low_model, clip, vae, positive_prompt, negative_prompt, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, seed, steps, cfg, sampler_name, scheduler, switch_step, shift, denoise, guides_json, start_images=None, ref_image=None, control_video=None, unique_id=None):
+    def run(self, high_model, low_model, clip, vae, positive_prompt, negative_prompt, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, structural_repulsion_boost, seed, steps, cfg, sampler_name, scheduler, switch_step, shift, denoise, guides_json, start_images=None, ref_image=None, control_video=None, unique_id=None):
         progress = GenerationProgress(unique_id)
         if sampler_name not in sampler_names():
             raise ValueError(f"Unknown sampler_name: {sampler_name}")
@@ -542,7 +548,7 @@ class WAN22GenerateAllInOne:
         positive = encode_prompt(clip, positive_prompt)
         negative = encode_prompt(clip, negative_prompt)
         progress.phase("Preparing guides")
-        positive_guided, negative_guided, latent = run_apply_guides(
+        positive_high, positive_low, negative_guided, latent = run_apply_guides(
             positive,
             negative,
             vae,
@@ -561,6 +567,7 @@ class WAN22GenerateAllInOne:
             start_images_strength,
             ref_image,
             control_video,
+            structural_repulsion_boost,
             sampler_latent_channels=sampler_channels,
             concat_slots=concat_slots,
             concat_slot_channels=sampler_channels,
@@ -568,8 +575,8 @@ class WAN22GenerateAllInOne:
         sampled = sample_wan22_video(
             high_model,
             low_model,
-            positive_guided,
-            positive_guided,
+            positive_high,
+            positive_low,
             negative_guided,
             latent,
             seed,

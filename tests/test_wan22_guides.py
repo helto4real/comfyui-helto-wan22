@@ -3,6 +3,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -73,6 +74,23 @@ class FakeVAE:
         return torch.zeros((1, 48, ((frames - 1) // 4) + 1, height // 16, width // 16), dtype=torch.float32)
 
 
+class RecordingFakeVAE(FakeVAE):
+    def __init__(self):
+        self.encoded_images = []
+
+    def encode(self, images):
+        self.encoded_images.append(images.detach().cpu().clone())
+        return super().encode(images)
+
+
+class ValueFakeVAE(FakeVAE):
+    def encode(self, images):
+        frames, height, width, _ = images.shape
+        latent_t = ((frames - 1) // 4) + 1
+        value = float(images[:, :, :, :3].mean())
+        return torch.full((1, 48, latent_t, height // 16, width // 16), value, dtype=torch.float32)
+
+
 def test_resolve_timing_duplicate_policies():
     load_package_with_stubs()
     from wan22testpkg.guide_models import GuideItem
@@ -95,11 +113,30 @@ def test_resolve_timing_duplicate_policies():
     assert [frame for frame, _ in resolve_timing(guides, "frame", 24, 9, "offset_next")] == [2, 3, 8]
 
 
+def test_resolve_timing_duplicate_policies_can_use_wan_latent_groups():
+    load_package_with_stubs()
+    from wan22testpkg.guide_models import GuideItem
+    from wan22testpkg.wan22_guides import resolve_timing
+
+    guides = [
+        GuideItem("input", "first.png", 0, 0),
+        GuideItem("input", "second.png", 3, 3),
+    ]
+
+    with pytest.raises(ValueError, match="Duplicate guide latent group"):
+        resolve_timing(guides, "frame", 24, 12, "error", duplicate_group_size=4)
+
+    assert [frame for frame, _ in resolve_timing(guides, "frame", 24, 12, "offset_next", duplicate_group_size=4)] == [
+        0,
+        4,
+    ]
+
+
 def test_apply_guides_builds_wan22_concat_latent_and_mask():
     load_package_with_stubs()
     from wan22testpkg.wan22_guides import apply_wan22_guides
 
-    positive, _, latent = apply_wan22_guides(
+    positive_high, positive_low, negative, latent = apply_wan22_guides(
         positive=[{}],
         negative=[{}],
         vae=FakeVAE(),
@@ -118,22 +155,36 @@ def test_apply_guides_builds_wan22_concat_latent_and_mask():
         start_images_strength=0.5,
     )
 
-    cond = positive[0]
+    cond = positive_low[0]
     assert latent["samples"].shape == (2, 48, 3, 4, 8)
     assert cond["concat_latent_image"].shape == (2, 96, 3, 4, 8)
     assert cond["concat_mask"].shape == (1, 4, 3, 4, 8)
     assert cond["concat_mask_index"] == 48
     assert float(cond["concat_mask"][0, 0, 0, 0, 0]) == 0.5
+    assert torch.equal(positive_high[0]["concat_mask"], positive_low[0]["concat_mask"])
+    assert torch.equal(negative[0]["concat_mask"], positive_high[0]["concat_mask"])
 
 
-def test_apply_guides_can_target_single_slot_wan_i2v_model():
+def test_manual_guides_encode_full_neutral_timeline_and_lock_first_group(monkeypatch):
     load_package_with_stubs()
-    from wan22testpkg.wan22_guides import apply_wan22_guides
+    import wan22testpkg.wan22_guides as wan22_guides
 
-    positive, _, latent = apply_wan22_guides(
+    def fake_load_guide_tensor(path, width, height, resize_mode, pad_color):
+        return torch.full((1, height, width, 3), 0.75, dtype=torch.float32), (width, height)
+
+    monkeypatch.setattr(wan22_guides, "resolve_image_path", lambda folder_alias, filename: filename)
+    monkeypatch.setattr(wan22_guides, "load_guide_tensor", fake_load_guide_tensor)
+
+    vae = RecordingFakeVAE()
+    guides_json = (
+        "{\"version\":1,\"guides\":["
+        "{\"folder_alias\":\"input\",\"filename\":\"first.png\",\"position\":0,\"calculated_frame\":0,\"strength\":1.0}"
+        "]}"
+    )
+    _, positive_low, _, _ = wan22_guides.apply_wan22_guides(
         positive=[{}],
         negative=[{}],
-        vae=FakeVAE(),
+        vae=vae,
         width=128,
         height=64,
         length=9,
@@ -144,20 +195,233 @@ def test_apply_guides_can_target_single_slot_wan_i2v_model():
         duplicate_policy="error",
         pad_color="0,0,0",
         global_strength=1.0,
-        guides_json="{\"version\":1,\"guides\":[]}",
-        start_images=torch.ones((1, 64, 128, 3)),
-        start_images_strength=1.0,
-        sampler_latent_channels=16,
-        concat_slots=1,
-        concat_slot_channels=16,
+        guides_json=guides_json,
     )
 
-    cond = positive[0]
-    assert latent["samples"].shape == (1, 16, 3, 4, 8)
-    assert cond["concat_latent_image"].shape == (1, 16, 3, 4, 8)
-    assert cond["concat_mask"].shape == (1, 4, 3, 4, 8)
-    assert cond["concat_mask_index"] == 0
-    assert float(cond["concat_mask"][0, 0, 0, 0, 0]) == 0.0
+    assert len(vae.encoded_images) == 1
+    timeline = vae.encoded_images[0]
+    assert timeline.shape == (9, 64, 128, 3)
+    assert torch.allclose(timeline[0], torch.full((64, 128, 3), 0.75))
+    assert torch.allclose(timeline[1], torch.full((64, 128, 3), 0.5))
+    assert torch.allclose(positive_low[0]["concat_mask"][0, :, 0], torch.zeros((4, 4, 8)))
+
+
+def test_apply_guides_rejects_latent_channel_mismatch():
+    load_package_with_stubs()
+    from wan22testpkg.wan22_guides import apply_wan22_guides
+
+    with pytest.raises(ValueError, match="encoded to 48 latent channels"):
+        apply_wan22_guides(
+            positive=[{}],
+            negative=[{}],
+            vae=FakeVAE(),
+            width=128,
+            height=64,
+            length=9,
+            batch_size=1,
+            fps=24,
+            timing_mode="frame",
+            resize_mode="stretch",
+            duplicate_policy="error",
+            pad_color="0,0,0",
+            global_strength=1.0,
+            guides_json="{\"version\":1,\"guides\":[]}",
+            start_images=torch.ones((1, 64, 128, 3)),
+            start_images_strength=1.0,
+            sampler_latent_channels=16,
+            concat_slots=1,
+            concat_slot_channels=16,
+        )
+
+
+def test_start_images_do_not_seed_sampler_latent_or_noise_mask():
+    load_package_with_stubs()
+    from wan22testpkg.wan22_guides import apply_wan22_guides
+
+    positive_high, positive_low, negative, latent = apply_wan22_guides(
+        positive=[{}],
+        negative=[{}],
+        vae=ValueFakeVAE(),
+        width=128,
+        height=64,
+        length=9,
+        batch_size=2,
+        fps=24,
+        timing_mode="frame",
+        resize_mode="stretch",
+        duplicate_policy="error",
+        pad_color="0,0,0",
+        global_strength=1.0,
+        guides_json="{\"version\":1,\"guides\":[]}",
+        start_images=torch.ones((1, 64, 128, 3)),
+        start_images_strength=0.75,
+    )
+
+    assert torch.allclose(latent["samples"], torch.zeros_like(latent["samples"]))
+    assert "noise_mask" not in latent
+    assert torch.allclose(positive_low[0]["concat_mask"][0, 0, 0], torch.full((4, 8), 0.25))
+    assert torch.equal(positive_high[0]["concat_mask"], positive_low[0]["concat_mask"])
+    assert torch.equal(negative[0]["concat_mask"], positive_high[0]["concat_mask"])
+
+
+def test_frame_zero_manual_guide_does_not_seed_sampler_latent(monkeypatch):
+    load_package_with_stubs()
+    import wan22testpkg.wan22_guides as wan22_guides
+
+    def fake_load_guide_tensor(path, width, height, resize_mode, pad_color):
+        return torch.full((1, height, width, 3), 0.8, dtype=torch.float32), (width, height)
+
+    monkeypatch.setattr(wan22_guides, "resolve_image_path", lambda folder_alias, filename: filename)
+    monkeypatch.setattr(wan22_guides, "load_guide_tensor", fake_load_guide_tensor)
+
+    guides_json = (
+        "{\"version\":1,\"guides\":["
+        "{\"folder_alias\":\"input\",\"filename\":\"first.png\",\"position\":0,\"calculated_frame\":0,\"strength\":0.6}"
+        "]}"
+    )
+    _, positive_low, _, latent = wan22_guides.apply_wan22_guides(
+        positive=[{}],
+        negative=[{}],
+        vae=ValueFakeVAE(),
+        width=128,
+        height=64,
+        length=9,
+        batch_size=1,
+        fps=24,
+        timing_mode="frame",
+        resize_mode="stretch",
+        duplicate_policy="error",
+        pad_color="0,0,0",
+        global_strength=1.0,
+        guides_json=guides_json,
+    )
+
+    assert torch.allclose(latent["samples"], torch.zeros_like(latent["samples"]))
+    assert "noise_mask" not in latent
+    assert torch.allclose(positive_low[0]["concat_mask"][0, :, 0], torch.full((4, 4, 8), 0.4))
+
+
+def test_non_zero_manual_guide_does_not_seed_sampler_latent(monkeypatch):
+    load_package_with_stubs()
+    import wan22testpkg.wan22_guides as wan22_guides
+
+    monkeypatch.setattr(wan22_guides, "resolve_image_path", lambda folder_alias, filename: filename)
+    monkeypatch.setattr(
+        wan22_guides,
+        "load_guide_tensor",
+        lambda path, width, height, resize_mode, pad_color: (torch.ones((1, height, width, 3)), (width, height)),
+    )
+
+    guides_json = (
+        "{\"version\":1,\"guides\":["
+        "{\"folder_alias\":\"input\",\"filename\":\"middle.png\",\"position\":8,\"calculated_frame\":8,\"strength\":1.0}"
+        "]}"
+    )
+    _, _, _, latent = wan22_guides.apply_wan22_guides(
+        positive=[{}],
+        negative=[{}],
+        vae=ValueFakeVAE(),
+        width=128,
+        height=64,
+        length=13,
+        batch_size=1,
+        fps=24,
+        timing_mode="frame",
+        resize_mode="stretch",
+        duplicate_policy="error",
+        pad_color="0,0,0",
+        global_strength=1.0,
+        guides_json=guides_json,
+    )
+
+    assert torch.allclose(latent["samples"], torch.zeros_like(latent["samples"]))
+    assert "noise_mask" not in latent
+
+
+def test_structural_repulsion_only_changes_high_noise_transition_mask(monkeypatch):
+    load_package_with_stubs()
+    import wan22testpkg.wan22_guides as wan22_guides
+
+    def fake_load_guide_tensor(path, width, height, resize_mode, pad_color):
+        image = torch.zeros((1, height, width, 3), dtype=torch.float32)
+        if "second" in str(path):
+            image[:, :, width // 2 :, :] = 1.0
+        return image, (width, height)
+
+    monkeypatch.setattr(wan22_guides, "resolve_image_path", lambda folder_alias, filename: filename)
+    monkeypatch.setattr(wan22_guides, "load_guide_tensor", fake_load_guide_tensor)
+
+    guides_json = (
+        "{\"version\":1,\"guides\":["
+        "{\"folder_alias\":\"input\",\"filename\":\"first.png\",\"position\":0,\"calculated_frame\":0,\"strength\":1.0},"
+        "{\"folder_alias\":\"input\",\"filename\":\"second.png\",\"position\":12,\"calculated_frame\":12,\"strength\":1.0}"
+        "]}"
+    )
+    positive_high, positive_low, negative, _ = wan22_guides.apply_wan22_guides(
+        positive=[{}],
+        negative=[{}],
+        vae=FakeVAE(),
+        width=128,
+        height=64,
+        length=17,
+        batch_size=1,
+        fps=24,
+        timing_mode="frame",
+        resize_mode="stretch",
+        duplicate_policy="error",
+        pad_color="0,0,0",
+        global_strength=1.0,
+        guides_json=guides_json,
+        structural_repulsion_boost=1.5,
+    )
+
+    high_mask = positive_high[0]["concat_mask"]
+    low_mask = positive_low[0]["concat_mask"]
+    transition_high = high_mask[0, 0, 1]
+    transition_low = low_mask[0, 0, 1]
+
+    assert torch.any(transition_high < transition_low)
+    assert torch.allclose(transition_low, torch.ones_like(transition_low))
+    assert torch.equal(negative[0]["concat_mask"], high_mask)
+    assert float(high_mask.min()) >= 0.0
+    assert float(high_mask.max()) <= 1.0
+
+
+def test_structural_repulsion_default_leaves_high_and_low_masks_equal(monkeypatch):
+    load_package_with_stubs()
+    import wan22testpkg.wan22_guides as wan22_guides
+
+    monkeypatch.setattr(wan22_guides, "resolve_image_path", lambda folder_alias, filename: filename)
+    monkeypatch.setattr(
+        wan22_guides,
+        "load_guide_tensor",
+        lambda path, width, height, resize_mode, pad_color: (torch.ones((1, height, width, 3)), (width, height)),
+    )
+
+    guides_json = (
+        "{\"version\":1,\"guides\":["
+        "{\"folder_alias\":\"input\",\"filename\":\"first.png\",\"position\":0,\"calculated_frame\":0,\"strength\":1.0},"
+        "{\"folder_alias\":\"input\",\"filename\":\"second.png\",\"position\":12,\"calculated_frame\":12,\"strength\":1.0}"
+        "]}"
+    )
+    positive_high, positive_low, _, _ = wan22_guides.apply_wan22_guides(
+        positive=[{}],
+        negative=[{}],
+        vae=FakeVAE(),
+        width=128,
+        height=64,
+        length=17,
+        batch_size=1,
+        fps=24,
+        timing_mode="frame",
+        resize_mode="stretch",
+        duplicate_policy="error",
+        pad_color="0,0,0",
+        global_strength=1.0,
+        guides_json=guides_json,
+    )
+
+    assert torch.equal(positive_high[0]["concat_mask"], positive_low[0]["concat_mask"])
 
 
 def test_all_in_one_sampler_splits_high_and_low_models():

@@ -147,7 +147,7 @@ function writePayload(node, payload) {
   const widget = getWidget(node, "guides_json");
   payload.version = 1;
   payload.guides = (payload.guides || []).map((guide) => ({ ...guide, calculated_frame: calcFrame(node, guide) }));
-  for (const key of ["fps", "timing_mode", "resize_mode", "duplicate_policy", "pad_color", "global_strength", "start_images_strength", "width", "height", "length"]) {
+  for (const key of ["fps", "timing_mode", "resize_mode", "duplicate_policy", "pad_color", "global_strength", "start_images_strength", "structural_repulsion_boost", "width", "height", "length"]) {
     const widgetValue = getWidgetValue(node, key, undefined);
     if (widgetValue !== undefined) payload[key] = widgetValue;
   }
