@@ -21,11 +21,11 @@ This package adds LTX-style multi-image guide management for WAN 2.2 while using
 
 ## Installation
 
-Clone or symlink this repository into your ComfyUI `custom_nodes` directory:
+Clone this repository into your ComfyUI `custom_nodes` directory:
 
 ```bash
 cd ~/git/ComfyUI/custom_nodes
-ln -s ~/git/comfyui-helto-wan22 comfyui-helto-wan22
+git clone https://github.com/helto4real/comfyui-helto-wan22.git
 ```
 
 Restart ComfyUI after installation.
