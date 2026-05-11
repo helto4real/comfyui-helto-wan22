@@ -196,3 +196,44 @@ def test_all_in_one_sampler_splits_high_and_low_models():
     assert calls[0]["force_full_denoise"] is False
     assert calls[1]["start_step"] == 3
     assert calls[1]["disable_noise"] is True
+
+
+def test_patch_model_sampling_shift_clones_model_and_sets_shift():
+    load_package_with_stubs()
+    from wan22testpkg.nodes import patch_model_sampling_shift
+
+    class Sampling:
+        multiplier = 1000
+
+        def __init__(self):
+            self.shift = None
+
+        def set_parameters(self, shift=1.0, multiplier=1000):
+            self.shift = shift
+            self.multiplier = multiplier
+
+    class Model:
+        def __init__(self):
+            self.sampling = Sampling()
+            self.patched = None
+
+        def clone(self):
+            clone = Model()
+            clone.sampling = self.sampling
+            return clone
+
+        def get_model_object(self, name):
+            assert name == "model_sampling"
+            return self.sampling
+
+        def add_object_patch(self, name, value):
+            assert name == "model_sampling"
+            self.patched = value
+            self.sampling = value
+
+    model = Model()
+    patched = patch_model_sampling_shift(model, 6.5)
+
+    assert patched is not model
+    assert patched.get_model_object("model_sampling").shift == 6.5
+    assert model.get_model_object("model_sampling").shift is None

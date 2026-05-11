@@ -1,3 +1,4 @@
+import copy
 import json
 
 from .guide_models import guide_summary, parse_guides_json
@@ -23,6 +24,7 @@ GENERATION_DEFAULTS = {
     "scheduler": "simple",
     "denoise": 1.0,
     "switch_step": 3,
+    "shift": 8.0,
 }
 
 
@@ -160,6 +162,18 @@ def model_concat_slots(model, latent_channels):
         return 2
 
 
+def patch_model_sampling_shift(model, shift):
+    patched = model.clone()
+    model_sampling = copy.copy(patched.get_model_object("model_sampling"))
+    try:
+        multiplier = getattr(model_sampling, "multiplier")
+        model_sampling.set_parameters(shift=float(shift), multiplier=multiplier)
+    except (AttributeError, TypeError):
+        model_sampling.set_parameters(shift=float(shift))
+    patched.add_object_patch("model_sampling", model_sampling)
+    return patched
+
+
 def sample_wan22_video(
     high_model,
     low_model,
@@ -286,6 +300,7 @@ def generation_input_types():
             "sampler_name": (sampler_names(), {"default": default_sampler_name()}),
             "scheduler": (scheduler_names(), {"default": default_scheduler_name()}),
             "switch_step": ("INT", {"default": GENERATION_DEFAULTS["switch_step"], "min": 0, "max": 10000, "tooltip": "Step where sampling switches from high_model to low_model. Common WAN 2.2 workflows use 3 with 5 total steps."}),
+            "shift": ("FLOAT", {"default": GENERATION_DEFAULTS["shift"], "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "WAN flow sampling shift. This matches ComfyUI's normal ModelSamplingSD3/WAN shift control."}),
             "denoise": ("FLOAT", {"default": GENERATION_DEFAULTS["denoise"], "min": 0.0, "max": 1.0, "step": 0.01}),
             "guides_json": ("STRING", {"default": DEFAULT_GUIDES_JSON, "tooltip": "Hidden serialized guide data used by the custom UI and saved in workflows."}),
         },
@@ -496,16 +511,20 @@ class WAN22GenerateAllInOne:
             "sampler_name",
             "scheduler",
             "switch_step",
+            "shift",
             "denoise",
         ]
         return (guides_part, tuple((name, kwargs.get(name)) for name in tracked))
 
-    def run(self, high_model, low_model, clip, vae, positive_prompt, negative_prompt, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, seed, steps, cfg, sampler_name, scheduler, switch_step, denoise, guides_json, start_images=None, ref_image=None, control_video=None, unique_id=None):
+    def run(self, high_model, low_model, clip, vae, positive_prompt, negative_prompt, width, height, length, batch_size, fps, timing_mode, resize_mode, duplicate_policy, pad_color, global_strength, start_images_strength, seed, steps, cfg, sampler_name, scheduler, switch_step, shift, denoise, guides_json, start_images=None, ref_image=None, control_video=None, unique_id=None):
         progress = GenerationProgress(unique_id)
         if sampler_name not in sampler_names():
             raise ValueError(f"Unknown sampler_name: {sampler_name}")
         if scheduler not in scheduler_names():
             raise ValueError(f"Unknown scheduler: {scheduler}")
+        progress.phase("Patching WAN model shift")
+        high_model = patch_model_sampling_shift(high_model, shift)
+        low_model = patch_model_sampling_shift(low_model, shift)
         progress.phase("Inspecting WAN model channels")
         high_channels = model_latent_channels(high_model)
         low_channels = model_latent_channels(low_model)
