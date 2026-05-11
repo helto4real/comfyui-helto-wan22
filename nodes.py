@@ -108,6 +108,29 @@ def decode_video_latent(vae, latent):
     return images
 
 
+def model_latent_channels(model):
+    try:
+        latent_format = model.get_model_object("latent_format")
+        return int(latent_format.latent_channels)
+    except Exception:
+        return None
+
+
+def model_concat_slots(model, latent_channels):
+    try:
+        diffusion_model = model.get_model_object("diffusion_model")
+        patch_channels = int(diffusion_model.patch_embedding.weight.shape[1])
+        extra_channels = patch_channels - int(latent_channels)
+        if extra_channels <= 0:
+            return 0
+        image_channels = extra_channels - 4
+        if image_channels <= 0:
+            return 0
+        return max(1, image_channels // int(latent_channels))
+    except Exception:
+        return 2
+
+
 def sample_wan22_video(
     high_model,
     low_model,
@@ -259,6 +282,9 @@ def run_apply_guides(
     start_images_strength=0.85,
     ref_image=None,
     control_video=None,
+    sampler_latent_channels=None,
+    concat_slots=2,
+    concat_slot_channels=None,
 ):
     if resize_mode == "pad":
         resize_mode = "contain"
@@ -281,6 +307,9 @@ def run_apply_guides(
         start_images_strength=start_images_strength,
         ref_image=ref_image,
         control_video=control_video,
+        sampler_latent_channels=sampler_latent_channels,
+        concat_slots=concat_slots,
+        concat_slot_channels=concat_slot_channels,
     )
 
 
@@ -439,6 +468,18 @@ class WAN22GenerateAllInOne:
             raise ValueError(f"Unknown sampler_name: {sampler_name}")
         if scheduler not in scheduler_names():
             raise ValueError(f"Unknown scheduler: {scheduler}")
+        high_channels = model_latent_channels(high_model)
+        low_channels = model_latent_channels(low_model)
+        uses_high = int(switch_step) > 0
+        uses_low = int(switch_step) < int(steps)
+        if uses_high and uses_low and high_channels and low_channels and high_channels != low_channels:
+            raise ValueError(f"WAN high_model and low_model latent channel counts differ: {high_channels} vs {low_channels}.")
+        sampler_channels = high_channels if uses_high else low_channels
+        high_slots = model_concat_slots(high_model, high_channels) if uses_high and high_channels else 2
+        low_slots = model_concat_slots(low_model, low_channels) if uses_low and low_channels else high_slots
+        concat_slots = min(high_slots, low_slots) if uses_high and uses_low else (high_slots if uses_high else low_slots)
+        if concat_slots <= 0:
+            raise ValueError("The selected high_model does not appear to expose WAN image-conditioning channels.")
         positive = encode_prompt(clip, positive_prompt)
         negative = encode_prompt(clip, negative_prompt)
         positive_guided, negative_guided, latent = run_apply_guides(
@@ -460,6 +501,9 @@ class WAN22GenerateAllInOne:
             start_images_strength,
             ref_image,
             control_video,
+            sampler_latent_channels=sampler_channels,
+            concat_slots=concat_slots,
+            concat_slot_channels=sampler_channels,
         )
         sampled = sample_wan22_video(
             high_model,

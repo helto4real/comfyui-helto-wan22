@@ -126,6 +126,40 @@ def test_apply_guides_builds_wan22_concat_latent_and_mask():
     assert float(cond["concat_mask"][0, 0, 0, 0, 0]) == 0.5
 
 
+def test_apply_guides_can_target_single_slot_wan_i2v_model():
+    load_package_with_stubs()
+    from wan22testpkg.wan22_guides import apply_wan22_guides
+
+    positive, _, latent = apply_wan22_guides(
+        positive=[{}],
+        negative=[{}],
+        vae=FakeVAE(),
+        width=128,
+        height=64,
+        length=9,
+        batch_size=1,
+        fps=24,
+        timing_mode="frame",
+        resize_mode="stretch",
+        duplicate_policy="error",
+        pad_color="0,0,0",
+        global_strength=1.0,
+        guides_json="{\"version\":1,\"guides\":[]}",
+        start_images=torch.ones((1, 64, 128, 3)),
+        start_images_strength=1.0,
+        sampler_latent_channels=16,
+        concat_slots=1,
+        concat_slot_channels=16,
+    )
+
+    cond = positive[0]
+    assert latent["samples"].shape == (1, 16, 3, 4, 8)
+    assert cond["concat_latent_image"].shape == (1, 16, 3, 4, 8)
+    assert cond["concat_mask"].shape == (1, 4, 3, 4, 8)
+    assert cond["concat_mask_index"] == 0
+    assert float(cond["concat_mask"][0, 0, 0, 0, 0]) == 0.0
+
+
 def test_all_in_one_sampler_splits_high_and_low_models():
     load_package_with_stubs()
     from wan22testpkg.nodes import sample_wan22_video

@@ -63,11 +63,11 @@ def round_dimension(value, scale):
     return rounded
 
 
-def create_empty_latent(width, height, length, batch_size, vae):
+def create_empty_latent(width, height, length, batch_size, vae, latent_channels=None):
     import comfy.model_management
 
     scale = wan_spatial_scale(vae)
-    channels = wan_latent_channels(vae)
+    channels = int(latent_channels or wan_latent_channels(vae))
     samples = torch.zeros(
         [int(batch_size), channels, latent_length(length), int(height) // scale, int(width) // scale],
         device=comfy.model_management.intermediate_device(),
@@ -75,7 +75,7 @@ def create_empty_latent(width, height, length, batch_size, vae):
     return {"samples": samples}
 
 
-def create_wan22_concat_latent(batch_size, channels, latent_t, latent_h, latent_w, device, dtype):
+def create_wan22_concat_latent(batch_size, channels, slots, latent_t, latent_h, latent_w, device, dtype):
     import comfy.latent_formats
 
     concat_latent = torch.zeros([int(batch_size), channels, latent_t, latent_h, latent_w], device=device, dtype=dtype)
@@ -83,7 +83,25 @@ def create_wan22_concat_latent(batch_size, channels, latent_t, latent_h, latent_
         concat_latent = comfy.latent_formats.Wan22().process_out(concat_latent)
     else:
         concat_latent = comfy.latent_formats.Wan21().process_out(concat_latent)
-    return concat_latent.repeat(1, 2, 1, 1, 1)
+    return concat_latent.repeat(1, int(slots), 1, 1, 1)
+
+
+def fit_latent_channels(latent, channels):
+    channels = int(channels)
+    if latent.shape[1] == channels:
+        return latent
+    if latent.shape[1] > channels:
+        return latent[:, :channels]
+    padding = torch.zeros(
+        latent.shape[0],
+        channels - latent.shape[1],
+        latent.shape[2],
+        latent.shape[3],
+        latent.shape[4],
+        device=latent.device,
+        dtype=latent.dtype,
+    )
+    return torch.cat((latent, padding), dim=1)
 
 
 def upscale_images(images, width, height):
@@ -170,6 +188,9 @@ def apply_wan22_guides(
     start_images_strength=0.85,
     ref_image=None,
     control_video=None,
+    sampler_latent_channels=None,
+    concat_slots=2,
+    concat_slot_channels=None,
 ):
     import node_helpers
 
@@ -178,11 +199,17 @@ def apply_wan22_guides(
     height = round_dimension(height, scale)
     length = max(1, int(length))
     batch_size = max(1, int(batch_size))
-    channels = wan_latent_channels(vae)
+    vae_channels = wan_latent_channels(vae)
+    channels = int(sampler_latent_channels or vae_channels)
+    slot_channels = int(concat_slot_channels or vae_channels)
+    concat_slots = max(1, int(concat_slots))
     latent_t = latent_length(length)
     latent_h = height // scale
     latent_w = width // scale
-    latent = create_empty_latent(width, height, length, batch_size, vae)
+    active_guides = [guide for guide in parse_guides_json(guides_json) if guide.enabled]
+    if control_video is not None and concat_slots < 2 and (start_images is not None or active_guides):
+        raise ValueError("This WAN model exposes only one image-conditioning slot, so control_video cannot be combined with start_images or manual guide frames.")
+    latent = create_empty_latent(width, height, length, batch_size, vae, latent_channels=channels)
     device = latent["samples"].device
     dtype = latent["samples"].dtype
 
@@ -201,27 +228,33 @@ def apply_wan22_guides(
         start_images=start_images,
         start_images_strength=start_images_strength,
     )
-    concat_latent = create_wan22_concat_latent(batch_size, channels, latent_t, latent_h, latent_w, device, dtype)
+    concat_latent = create_wan22_concat_latent(batch_size, slot_channels, concat_slots, latent_t, latent_h, latent_w, device, dtype)
     guide_latent = vae.encode(timeline[:, :, :, :3])
-    concat_latent[:, channels:, : guide_latent.shape[2]] = guide_latent[:, :, : concat_latent.shape[2]].to(device=device, dtype=dtype)
+    guide_latent = fit_latent_channels(guide_latent, slot_channels)
+    guide_slot_start = slot_channels if concat_slots > 1 else 0
+    concat_latent[:, guide_slot_start : guide_slot_start + slot_channels, : guide_latent.shape[2]] = guide_latent[
+        :, :, : concat_latent.shape[2]
+    ].to(device=device, dtype=dtype)
 
     if control_video is not None:
         control_video = upscale_images(control_video[:length], width, height)
         control_video = control_video.to(device=device, dtype=torch.float32)
         control_latent = vae.encode(control_video[:, :, :, :3])
-        concat_latent[:, :channels, : control_latent.shape[2]] = control_latent[:, :, : concat_latent.shape[2]].to(
+        control_latent = fit_latent_channels(control_latent, slot_channels)
+        concat_latent[:, :slot_channels, : control_latent.shape[2]] = control_latent[:, :, : concat_latent.shape[2]].to(
             device=device,
             dtype=dtype,
         )
 
     mask = mask_frames.view(1, latent_t, 4, latent_h, latent_w).transpose(1, 2).to(device=device, dtype=dtype)
+    concat_mask_index = slot_channels if concat_slots > 1 else 0
     positive = node_helpers.conditioning_set_values(
         positive,
-        {"concat_latent_image": concat_latent, "concat_mask": mask, "concat_mask_index": channels},
+        {"concat_latent_image": concat_latent, "concat_mask": mask, "concat_mask_index": concat_mask_index},
     )
     negative = node_helpers.conditioning_set_values(
         negative,
-        {"concat_latent_image": concat_latent, "concat_mask": mask, "concat_mask_index": channels},
+        {"concat_latent_image": concat_latent, "concat_mask": mask, "concat_mask_index": concat_mask_index},
     )
 
     if ref_image is not None:
